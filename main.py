@@ -112,6 +112,7 @@ def fetch_baselines() -> dict[str, float]:
     Loads player stats for LOAD_YEARS via nflreadpy and returns:
         { player_name: avg_fantasy_points_per_game }
     Uses half-PPR points when available, falls back to standard fantasy points.
+    Handles both pandas and Polars DataFrames.
     """
     log.info("Loading nflreadpy player stats for seasons %s …", LOAD_YEARS)
     try:
@@ -120,9 +121,16 @@ def fetch_baselines() -> dict[str, float]:
         log.error("nflreadpy failed: %s", exc)
         return {}
 
-    # Convert to proper DataFrame if needed
-    if not isinstance(df, pd.DataFrame):
-        log.error("nflreadpy did not return a DataFrame: %s", type(df))
+    # Convert Polars DataFrame to pandas if needed
+    try:
+        if hasattr(df, 'to_pandas'):  # Polars DataFrame
+            log.info("Converting Polars DataFrame to pandas …")
+            df = df.to_pandas()
+        elif not isinstance(df, pd.DataFrame):
+            log.error("nflreadpy returned unsupported type: %s", type(df))
+            return {}
+    except Exception as exc:
+        log.error("Error converting DataFrame: %s", exc)
         return {}
 
     # Detect available columns
