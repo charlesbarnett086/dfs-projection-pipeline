@@ -19,6 +19,7 @@ from collections import defaultdict
 
 import requests
 import nflreadpy as nfl
+import pandas as pd
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -119,6 +120,11 @@ def fetch_baselines() -> dict[str, float]:
         log.error("nflreadpy failed: %s", exc)
         return {}
 
+    # Convert to proper DataFrame if needed
+    if not isinstance(df, pd.DataFrame):
+        log.error("nflreadpy did not return a DataFrame: %s", type(df))
+        return {}
+
     # Detect available columns
     pts_col  = next((c for c in ("fantasy_points_half_ppr", "fantasy_points_ppr",
                                   "fantasy_points") if c in df.columns), None)
@@ -131,16 +137,29 @@ def fetch_baselines() -> dict[str, float]:
 
     log.info("nflreadpy: using '%s' as points column.", pts_col)
 
-    sub = df[[name_col, pts_col]].dropna()
-    sub = sub[sub[pts_col].astype(float) > 0]
+    try:
+        # Select columns and remove NaN values
+        sub = df[[name_col, pts_col]].copy()
+        sub = sub[sub[pts_col].notna()]
+        sub = sub[pd.to_numeric(sub[pts_col], errors='coerce').notna()]
+        sub = sub[pd.to_numeric(sub[pts_col], errors='coerce') > 0]
+    except Exception as exc:
+        log.error("Error processing nflreadpy data: %s", exc)
+        return {}
 
     # Average per-game across all rows (each row = one player-game)
     totals: dict[str, list[float]] = defaultdict(list)
     for _, row in sub.iterrows():
-        totals[str(row[name_col]).strip()].append(float(row[pts_col]))
+        try:
+            name = str(row[name_col]).strip()
+            pts = float(row[pts_col])
+            totals[name].append(pts)
+        except (ValueError, TypeError) as e:
+            log.debug("Skipping row due to conversion error: %s", e)
+            continue
 
     baselines = {name: round(sum(vals) / len(vals), 3)
-                 for name, vals in totals.items()}
+                 for name, vals in totals.items() if vals}
 
     log.info("nflreadpy: %d player baselines computed.", len(baselines))
     return baselines
