@@ -5,14 +5,30 @@ NFL DFS Projection Pipeline
 Sources:
   1. Sleeper API    – active rosters, positions, depth-chart ranks
   2. nfl_data_py    – historical per-game fantasy-point baselines (rolling 3 seasons)
-                      with recency weighting (last RECENCY_WEEKS weeks count 2×)
-                      LOAD_YEARS is computed dynamically — no manual updates needed.
-                      If the current season has no data yet (e.g. pre-Week 1),
-                      the pipeline gracefully falls back to the prior two seasons.
+                    with recency weighting (last RECENCY_WEEKS weeks count 2×)
+                    LOAD_YEARS is computed dynamically — no manual updates needed.
+                    If the current season has no data yet (e.g. pre-Week 1),
+                    the pipeline gracefully falls back to the prior two seasons.
   3. The Odds API   – live game totals used to scale projections up/down
 
 Output:
-  POST {"tab": "DK_Projections", "clear": True, "rows": rows} → GOOGLE_WEBAPP_URL
+  One tab per position (QB, RB, WR, TE, K, DEF) + a "Color Key" tab, each containing:
+    Name | Position | Team | DK Salary | DK Projection | FD Projection | Ownership
+  Rows are color-coded by projection tier (position-relative percentile).
+  POST {"tab": "...", "clear": True, "rows": rows, "rowColors": colors} → GOOGLE_WEBAPP_URL
+
+  ── Google Apps Script requirement ──────────────────────────────────────────
+  Your Apps Script doPost() must handle the "rowColors" field in the payload.
+  After writing each row, apply the background color from rowColors[i] to that row.
+  Example snippet to add inside your doPost() after writing rows:
+    var colors = data.rowColors;
+    if (colors && colors.length === rows.length) {
+      for (var i = 0; i < rows.length; i++) {
+        sheet.getRange(startRow + i, 1, 1, rows[i].length)
+             .setBackground(colors[i]);
+      }
+    }
+  ────────────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -65,7 +81,59 @@ PROJ_CEILING = {
     "TE": 14.0, "K":  10.0, "DEF": 12.0,
 }
 
-HEADERS = ["Name", "Position", "Team", "Salary", "Projection", "Ownership"]
+# ── FanDuel vs DraftKings scoring adjustments ────────────────────────────────
+# Key differences accounted for:
+#   QB  – DK awards +3 bonus for 300+ passing yards; FD does not.
+#   RB  – DK is full PPR (1 pt/reception); FD is half PPR (0.5 pt/rec).
+#          DK awards +3 bonus for 100+ rushing yards; FD does not.
+#   WR  – Same PPR and bonus difference as RB (applied to receiving).
+#   TE  – Same PPR and bonus difference as WR.
+#   K   – Scoring is nearly identical on both sites; factor = 1.00.
+#   DEF – FD does not award as many incremental bonuses for sacks/TOs;
+#          slight downward adjustment applied.
+FD_ADJUSTMENT: dict[str, float] = {
+    "QB":  0.95,
+    "RB":  0.90,
+    "WR":  0.87,
+    "TE":  0.88,
+    "K":   1.00,
+    "DEF": 0.95,
+}
+
+# ── Tier color scheme ─────────────────────────────────────────────────────────
+# Tiers are assigned per-position so a WR's percentile is relative to other WRs,
+# not QBs. Percentile thresholds run from the top (rank 1 = highest projection).
+#
+#   Elite   top 15%     Gold   #FFD966  — must-start anchors & game-stack pieces
+#   Strong  top 35%    Green   #93C47D  — core lineup builders, best edge plays
+#   Solid   top 60%     Blue   #9FC5E8  — cash-game plays, reliable floors
+#   Average top 80%    White   #FFFFFF  — situational / matchup-dependent
+#   Fade    bottom 20%   Red   #EA9999  — below average, avoid or GPP dart only
+#
+TIER_COLORS: dict[str, str] = {
+    "Elite":   "#FFD966",   # gold
+    "Strong":  "#93C47D",   # green
+    "Solid":   "#9FC5E8",   # blue
+    "Average": "#FFFFFF",   # white
+    "Fade":    "#EA9999",   # pink/red
+}
+HEADER_COLOR = "#1F4E79"    # dark navy for every header row
+
+# Column headers for each position sheet
+HEADERS = ["Name", "Position", "Team", "DK Salary", "DK Projection", "FD Projection", "Ownership"]
+
+# ── Color Key tab content ─────────────────────────────────────────────────────
+COLOR_KEY_HEADERS = ["Color", "Tier", "Percentile", "DFS Recommendation"]
+_COLOR_KEY_DATA = [
+    ("Elite",   "Top 15%",      "Must-start anchors & game-stack core pieces"),
+    ("Strong",  "Top 35%",      "High-floor edge plays — core lineup builders"),
+    ("Solid",   "Top 60%",      "Reliable cash-game plays, safe floors"),
+    ("Average", "Top 80%",      "Situational — use only in strong matchups"),
+    ("Fade",    "Bottom 20%",   "Below average — avoid or contrarian GPP dart"),
+]
+# Row data for Color Key tab (first cell left blank; row fill color IS the key)
+COLOR_KEY_ROWS       = [["", tier, pct, rec] for tier, pct, rec in _COLOR_KEY_DATA]
+COLOR_KEY_ROW_COLORS = [TIER_COLORS[tier]    for tier, _,   _   in _COLOR_KEY_DATA]
 
 # ── Credentials (env vars take priority; hardcoded values are fallbacks) ────
 ODDS_API_KEY      = os.environ.get("ODDS_API_KEY",      "ab02e77ff7e1a86cb058f27c62396f38")
@@ -156,9 +224,9 @@ def fetch_baselines() -> dict[str, float]:
 
     # Detect scoring and name columns
     pts_col  = next((c for c in ("fantasy_points_half_ppr", "fantasy_points_ppr",
-                    "fantasy_points") if c in df.columns), None)
+                                 "fantasy_points") if c in df.columns), None)
     name_col = next((c for c in ("player_display_name", "player_name",
-                    "player_id") if c in df.columns), None)
+                                 "player_id") if c in df.columns), None)
 
     if not pts_col or not name_col:
         log.error("nfl_data_py: required columns missing. Got: %s", list(df.columns))
@@ -173,13 +241,17 @@ def fetch_baselines() -> dict[str, float]:
     if has_season and has_week:
         max_season = int(df["season"].max())
         max_week   = int(df[df["season"] == max_season]["week"].max())
-        log.info("nfl_data_py: latest data → season %d week %d (recent window: last %d weeks).",
-                 max_season, max_week, RECENCY_WEEKS)
+        log.info(
+            "nfl_data_py: latest data → season %d week %d (recent window: last %d weeks).",
+            max_season, max_week, RECENCY_WEEKS,
+        )
 
         def _weight(row) -> float:
             """Return 2.0 for recent games, 1.0 for older games."""
-            return 2.0 if (row["season"] == max_season
-                           and (max_week - row["week"]) < RECENCY_WEEKS) else 1.0
+            return 2.0 if (
+                row["season"] == max_season
+                and (max_week - row["week"]) < RECENCY_WEEKS
+            ) else 1.0
     else:
         def _weight(row) -> float:  # type: ignore[misc]
             return 1.0
@@ -329,78 +401,179 @@ def _ownership(rank: int, pos: str) -> float:
 
 
 def _fmt_proj(projection: float) -> str:
-    """Format raw projection as a fixed 2-decimal number, e.g. 22.50."""
+    """Format projection as a fixed 2-decimal string, e.g. '22.50'."""
     return f"{projection:.2f}"
 
 
+def _fd_proj(dk_proj: float, pos: str) -> str:
+    """
+    Convert a DK projection to an FD projection using position-specific
+    adjustment factors that account for:
+      - Half-PPR (FD) vs full-PPR (DK) for skill positions
+      - No yardage milestone bonuses on FD (DK: +3 for 100+ rush/rec yds,
+        +3 for 300+ pass yds)
+      - Minor defensive scoring structure differences
+    Returns a formatted 2-decimal string.
+    """
+    return _fmt_proj(round(dk_proj * FD_ADJUSTMENT.get(pos, 1.0), 2))
+
+
+def _assign_tiers(n: int) -> list[str]:
+    """
+    Given n players already sorted highest-projection-first, return a tier
+    label for each based on their position-relative percentile rank.
+
+    Thresholds (measured from the top):
+        Elite   → top 15%   — Gold   must-start anchors & game-stack pieces
+        Strong  → top 35%   — Green  core lineup builders, best edge plays
+        Solid   → top 60%   — Blue   cash-game plays, reliable floors
+        Average → top 80%   — White  situational / matchup-dependent
+        Fade    → bottom 20% — Red   below average, avoid or GPP dart
+    """
+    tiers: list[str] = []
+    for rank in range(1, n + 1):
+        pct = rank / n          # fraction from top: 1/n for rank-1, 1.0 for last
+        if pct <= 0.15:
+            tiers.append("Elite")
+        elif pct <= 0.35:
+            tiers.append("Strong")
+        elif pct <= 0.60:
+            tiers.append("Solid")
+        elif pct <= 0.80:
+            tiers.append("Average")
+        else:
+            tiers.append("Fade")
+    return tiers
+
+
 # ════
-# 4. Build projection rows
+# 4. Build projection rows — one dict entry per position
 # ════
 
-def build_rows(sleeper: dict, baselines: dict, multipliers: dict) -> list[list]:
-    """Merge all three sources and return [HEADERS, row, row, …]."""
+def build_rows(
+    sleeper: dict,
+    baselines: dict,
+    multipliers: dict,
+) -> dict[str, tuple[list[list], list[str]]]:
+    """
+    Merge all three sources and return a dict keyed by position:
+        {
+          "QB": (rows, row_colors),
+          "RB": (rows, row_colors),
+          …
+        }
+
+    rows       – [HEADERS, data_row, ...]
+    row_colors – [HEADER_COLOR, tier_hex, ...]  (parallel to rows)
+
+    Each data row: [Name, Position, Team, DK Salary, DK Projection, FD Projection, Ownership]
+    Each data row is color-coded by its projection tier within the position group.
+    """
 
     # Per-position average baseline (fallback for players without history)
     pos_avg: dict[str, float] = {}
     for pos in SKILL_POSITIONS:
-        vals = [_match_baseline(n, baselines)
-                for n, d in sleeper.items()
-                if d["position"] == pos and _match_baseline(n, baselines) > 0]
+        vals = [
+            _match_baseline(n, baselines)
+            for n, d in sleeper.items()
+            if d["position"] == pos and _match_baseline(n, baselines) > 0
+        ]
         pos_avg[pos] = round(sum(vals) / len(vals), 3) if vals else 10.0
 
+    # Group players by position
     by_pos: dict[str, list[dict]] = defaultdict(list)
     for name, info in sleeper.items():
         pos      = info["position"]
         baseline = _match_baseline(name, baselines) or pos_avg.get(pos, 10.0)
-        proj     = round(baseline * _team_mult(info["team"], multipliers), 2)
+        dk_proj  = round(baseline * _team_mult(info["team"], multipliers), 2)
         by_pos[pos].append({
-            "name":  name,
-            "pos":   pos,
-            "team":  info["team"],
-            "depth": info["depth_order"],
-            "proj":  proj,
+            "name":    name,
+            "pos":     pos,
+            "team":    info["team"],
+            "depth":   info["depth_order"],
+            "dk_proj": dk_proj,
         })
 
-    rows: list[list] = [HEADERS]
+    # Build per-position tables with tier colors
+    position_tables: dict[str, tuple[list[list], list[str]]] = {}
     for pos in sorted(by_pos):
-        ranked = sorted(by_pos[pos], key=lambda p: (-p["proj"], p["depth"]))
-        for rank, p in enumerate(ranked, 1):
+        ranked = sorted(by_pos[pos], key=lambda p: (-p["dk_proj"], p["depth"]))
+        tiers  = _assign_tiers(len(ranked))
+
+        rows:       list[list] = [HEADERS]
+        row_colors: list[str]  = [HEADER_COLOR]        # header gets navy
+
+        for rank, (tier, p) in enumerate(zip(tiers, ranked), 1):
             rows.append([
                 p["name"],
                 p["pos"],
                 p["team"],
-                _salary(p["pos"], p["proj"], p["depth"]),
-                _fmt_proj(p["proj"]),                    # e.g. "22.50"
-                round(_ownership(rank, p["pos"]) / 100, 4),  # e.g. 0.14
+                _salary(p["pos"], p["dk_proj"], p["depth"]),
+                _fmt_proj(p["dk_proj"]),                       # DK Projection
+                _fd_proj(p["dk_proj"], p["pos"]),              # FD Projection
+                round(_ownership(rank, p["pos"]) / 100, 4),   # Ownership
             ])
+            row_colors.append(TIER_COLORS[tier])
 
-    log.info("Projection table: %d player rows built.", len(rows) - 1)
-    return rows
+        position_tables[pos] = (rows, row_colors)
+        log.info(
+            "Position %s: %d rows | Elite=%d Strong=%d Solid=%d Average=%d Fade=%d",
+            pos, len(ranked),
+            tiers.count("Elite"), tiers.count("Strong"), tiers.count("Solid"),
+            tiers.count("Average"), tiers.count("Fade"),
+        )
+
+    return position_tables
 
 
 # ════
-# 5. Post to Google Sheets
+# 5. Post to Google Sheets — one tab per position + Color Key
 # ════
 
-def post_to_sheets(rows: list[list]) -> bool:
+def post_to_sheets(tab: str, rows: list[list], row_colors: list[str]) -> bool:
+    """
+    POST a single tab's rows to Google Sheets, including row background colors.
+
+    Payload fields:
+        tab        – sheet/tab name
+        clear      – wipe the tab before writing
+        rows       – list of rows (first row is headers)
+        rowColors  – parallel list of hex color strings, one per row
+                     (Apps Script applies these as row background colors)
+    """
     if not GOOGLE_WEBAPP_URL:
         log.error("GOOGLE_WEBAPP_URL is not set — cannot export.")
         return False
 
-    payload = {"tab": "DK_Projections", "clear": True, "rows": rows}
-    log.info("POSTing %d rows to Google Sheets …", len(rows) - 1)
+    payload = {
+        "tab":       tab,
+        "clear":     True,
+        "rows":      rows,
+        "rowColors": row_colors,
+    }
+    log.info("POSTing %d rows to Google Sheets tab '%s' …", len(rows) - 1, tab)
     try:
         resp = requests.post(GOOGLE_WEBAPP_URL, json=payload, timeout=30)
         resp.raise_for_status()
-        log.info("Export successful. Response: %s", resp.text[:300])
+        log.info("Tab '%s' export successful. Response: %s", tab, resp.text[:300])
         return True
     except requests.exceptions.Timeout:
-        log.error("Google Sheets POST timed out.")
+        log.error("Google Sheets POST timed out (tab '%s').", tab)
     except requests.exceptions.HTTPError as exc:
         log.error("HTTP %s: %s", exc.response.status_code, exc.response.text[:300])
     except requests.exceptions.RequestException as exc:
-        log.error("Google Sheets POST failed: %s", exc)
+        log.error("Google Sheets POST failed (tab '%s'): %s", tab, exc)
     return False
+
+
+def post_color_key_tab() -> bool:
+    """
+    Post the Color Key legend tab explaining what each row highlight means.
+    The first cell of each row is left blank — the row fill color IS the key.
+    """
+    rows       = [COLOR_KEY_HEADERS] + COLOR_KEY_ROWS
+    row_colors = [HEADER_COLOR]      + COLOR_KEY_ROW_COLORS
+    return post_to_sheets(tab="Color Key", rows=rows, row_colors=row_colors)
 
 
 # ════
@@ -418,8 +591,24 @@ if __name__ == "__main__":
     baselines   = fetch_baselines()
     multipliers = fetch_multipliers()
 
-    rows = build_rows(sleeper_players, baselines, multipliers)
-    ok   = post_to_sheets(rows)
+    # Build one table per position (rows + parallel row colors)
+    position_tables = build_rows(sleeper_players, baselines, multipliers)
 
-    log.info("═══ Pipeline %s ═══", "COMPLETE ✓" if ok else "FINISHED — sheets export failed")
-    sys.exit(0 if ok else 1)
+    all_ok = True
+
+    # Post each position to its own Google Sheets tab
+    for pos in sorted(position_tables):
+        rows, row_colors = position_tables[pos]
+        ok = post_to_sheets(tab=pos, rows=rows, row_colors=row_colors)
+        if not ok:
+            all_ok = False
+
+    # Post the Color Key legend tab last
+    if not post_color_key_tab():
+        all_ok = False
+
+    log.info(
+        "═══ Pipeline %s ═══",
+        "COMPLETE ✓" if all_ok else "FINISHED — one or more sheet exports failed",
+    )
+    sys.exit(0 if all_ok else 1)
