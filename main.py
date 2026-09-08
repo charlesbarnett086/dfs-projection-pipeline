@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
 NFL DFS Projection Pipeline
-───────────────────────────
+────
 Sources:
   1. Sleeper API    – active rosters, positions, depth-chart ranks
-  2. nflreadpy      – historical per-game fantasy-point baselines (2023-2024)
+  2. nfl_data_py    – historical per-game fantasy-point baselines (rolling 3 seasons)
+                      with recency weighting (last RECENCY_WEEKS weeks count 2×)
+                      LOAD_YEARS is computed dynamically — no manual updates needed.
+                      If the current season has no data yet (e.g. pre-Week 1),
+                      the pipeline gracefully falls back to the prior two seasons.
   3. The Odds API   – live game totals used to scale projections up/down
 
 Output:
@@ -16,12 +20,12 @@ import re
 import sys
 import logging
 from collections import defaultdict
+from datetime import datetime
 
 import requests
-import nflreadpy as nfl
-import pandas as pd
+import nfl_data_py as nfl
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+# ── Logging ────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -29,11 +33,19 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# ── Constants ────
 SLEEPER_URL     = "https://api.sleeper.app/v1/players/nfl"
 ODDS_API_URL    = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/"
 AVG_GAME_TOTAL  = 44.5          # league-average O/U used as multiplier baseline
-LOAD_YEARS      = [2023, 2024]  # seasons passed to nflreadpy
+
+# Dynamic rolling 3-season window — never needs manual updating.
+# E.g. run in Sept 2026 → [2024, 2025, 2026]; 2026 rows added as games are played.
+_CURRENT_YEAR = datetime.now().year
+LOAD_YEARS    = [_CURRENT_YEAR - 2, _CURRENT_YEAR - 1, _CURRENT_YEAR]
+
+# At a new-season start, end-of-prior-season form matters more → wider window.
+# Weeks weighted 2× for recency. 8 weeks covers the last ~2 months of the prior season.
+RECENCY_WEEKS = 8
 
 SKILL_POSITIONS = {"QB", "RB", "WR", "TE", "K", "DEF"}
 
@@ -47,7 +59,7 @@ SALARY_BANDS = {
     "DEF": (2200, 4800),
 }
 
-# Realistic per-game fantasy-point ceiling for salary scaling
+# Realistic per-game fantasy-point ceiling for salary scaling and % projection display
 PROJ_CEILING = {
     "QB": 30.0, "RB": 22.0, "WR": 18.0,
     "TE": 14.0, "K":  10.0, "DEF": 12.0,
@@ -55,7 +67,7 @@ PROJ_CEILING = {
 
 HEADERS = ["Name", "Position", "Team", "Salary", "Projection", "Ownership"]
 
-# ── Credentials (env vars take priority; hardcoded values are fallbacks) ───────
+# ── Credentials (env vars take priority; hardcoded values are fallbacks) ────
 ODDS_API_KEY      = os.environ.get("ODDS_API_KEY",      "ab02e77ff7e1a86cb058f27c62396f38")
 GOOGLE_WEBAPP_URL = os.environ.get(
     "GOOGLE_WEBAPP_URL",
@@ -63,9 +75,9 @@ GOOGLE_WEBAPP_URL = os.environ.get(
 )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 # 1. Sleeper API — active rosters & depth charts
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 
 def fetch_sleeper_players() -> dict[str, dict]:
     """
@@ -103,79 +115,102 @@ def fetch_sleeper_players() -> dict[str, dict]:
     return players
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. nflreadpy — historical per-game fantasy-point baselines
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
+# 2. nfl_data_py — weekly stats with recency weighting
+# ════
 
 def fetch_baselines() -> dict[str, float]:
     """
-    Loads player stats for LOAD_YEARS via nflreadpy and returns:
-        { player_name: avg_fantasy_points_per_game }
-    Uses half-PPR points when available, falls back to standard fantasy points.
-    Handles both pandas and Polars DataFrames.
+    Loads player stats for LOAD_YEARS via nfl_data_py and returns:
+        { player_name: weighted_avg_fantasy_points_per_game }
+
+    LOAD_YEARS is a rolling 3-season window computed at runtime (e.g. [2024,2025,2026]).
+    If the current season has no rows yet (pre-Week 1 of a new season), the pipeline
+    automatically falls back to the prior two seasons so projections never break.
+
+    The most recent RECENCY_WEEKS weeks of the latest available season are weighted 2×
+    to reflect current form more accurately than a flat historical average.
+    Uses half-PPR scoring when available, falls back to full-PPR or standard.
     """
-    log.info("Loading nflreadpy player stats for seasons %s …", LOAD_YEARS)
-    try:
-        df = nfl.load_player_stats(LOAD_YEARS)
-    except Exception as exc:
-        log.error("nflreadpy failed: %s", exc)
+    log.info("Loading nfl_data_py player stats for seasons %s …", LOAD_YEARS)
+
+    # Try the full rolling window first; if the current year isn't available yet,
+    # fall back to just the prior two seasons.
+    for years_to_try in (LOAD_YEARS, LOAD_YEARS[:-1]):
+        try:
+            df = nfl.import_weekly_data(years_to_try)
+            if df is not None and not df.empty:
+                if years_to_try != LOAD_YEARS:
+                    log.warning(
+                        "nfl_data_py: no data for %d yet — using %s as fallback.",
+                        LOAD_YEARS[-1], years_to_try,
+                    )
+                log.info("nfl_data_py: loaded %d rows for seasons %s.", len(df), years_to_try)
+                break
+            log.warning("nfl_data_py: empty result for seasons %s, trying fallback …", years_to_try)
+        except Exception as exc:
+            log.warning("nfl_data_py failed for %s: %s — trying fallback …", years_to_try, exc)
+    else:
+        log.error("nfl_data_py: all attempts failed, no baseline data available.")
         return {}
 
-    # Convert Polars DataFrame to pandas if needed
-    try:
-        if hasattr(df, 'to_pandas'):  # Polars DataFrame
-            log.info("Converting Polars DataFrame to pandas …")
-            df = df.to_pandas()
-        elif not isinstance(df, pd.DataFrame):
-            log.error("nflreadpy returned unsupported type: %s", type(df))
-            return {}
-    except Exception as exc:
-        log.error("Error converting DataFrame: %s", exc)
-        return {}
-
-    # Detect available columns
+    # Detect scoring and name columns
     pts_col  = next((c for c in ("fantasy_points_half_ppr", "fantasy_points_ppr",
-                                  "fantasy_points") if c in df.columns), None)
-    name_col = next((c for c in ("player_name", "player_display_name",
-                                  "player_id") if c in df.columns), None)
+                    "fantasy_points") if c in df.columns), None)
+    name_col = next((c for c in ("player_display_name", "player_name",
+                    "player_id") if c in df.columns), None)
 
     if not pts_col or not name_col:
-        log.error("nflreadpy: required columns missing. Got: %s", list(df.columns))
+        log.error("nfl_data_py: required columns missing. Got: %s", list(df.columns))
         return {}
 
-    log.info("nflreadpy: using '%s' as points column.", pts_col)
+    log.info("nfl_data_py: using '%s' as points column.", pts_col)
 
-    try:
-        # Select columns and remove NaN values
-        sub = df[[name_col, pts_col]].copy()
-        sub = sub[sub[pts_col].notna()]
-        sub = sub[pd.to_numeric(sub[pts_col], errors='coerce').notna()]
-        sub = sub[pd.to_numeric(sub[pts_col], errors='coerce') > 0]
-    except Exception as exc:
-        log.error("Error processing nflreadpy data: %s", exc)
-        return {}
+    # Determine recency cutoff from the most recent season + week in the data
+    has_season = "season" in df.columns
+    has_week   = "week"   in df.columns
 
-    # Average per-game across all rows (each row = one player-game)
-    totals: dict[str, list[float]] = defaultdict(list)
+    if has_season and has_week:
+        max_season = int(df["season"].max())
+        max_week   = int(df[df["season"] == max_season]["week"].max())
+        log.info("nfl_data_py: latest data → season %d week %d (recent window: last %d weeks).",
+                 max_season, max_week, RECENCY_WEEKS)
+
+        def _weight(row) -> float:
+            """Return 2.0 for recent games, 1.0 for older games."""
+            return 2.0 if (row["season"] == max_season
+                           and (max_week - row["week"]) < RECENCY_WEEKS) else 1.0
+    else:
+        def _weight(row) -> float:  # type: ignore[misc]
+            return 1.0
+
+    keep_cols = [name_col, pts_col] + (["season", "week"] if has_season and has_week else [])
+    sub = df[keep_cols].dropna()
+    sub = sub[sub[pts_col].astype(float) > 0].copy()
+
+    # Weighted average: w_sum / w_tot per player
+    w_sum: dict[str, float] = defaultdict(float)
+    w_tot: dict[str, float] = defaultdict(float)
+
     for _, row in sub.iterrows():
-        try:
-            name = str(row[name_col]).strip()
-            pts = float(row[pts_col])
-            totals[name].append(pts)
-        except (ValueError, TypeError) as e:
-            log.debug("Skipping row due to conversion error: %s", e)
-            continue
+        name   = str(row[name_col]).strip()
+        pts    = float(row[pts_col])
+        weight = _weight(row)
+        w_sum[name] += pts * weight
+        w_tot[name] += weight
 
-    baselines = {name: round(sum(vals) / len(vals), 3)
-                 for name, vals in totals.items() if vals}
+    baselines = {
+        name: round(w_sum[name] / w_tot[name], 3)
+        for name in w_sum if w_tot[name] > 0
+    }
 
-    log.info("nflreadpy: %d player baselines computed.", len(baselines))
+    log.info("nfl_data_py: %d player baselines computed.", len(baselines))
     return baselines
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 # 3. The Odds API — live game totals → projection multipliers
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 
 def fetch_multipliers() -> dict[str, float]:
     """
@@ -233,9 +268,9 @@ def _game_total(game: dict) -> float | None:
     return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 # Helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 
 def _normalize(name: str) -> str:
     return re.sub(r"[^a-z ]", "", name.lower()).strip()
@@ -293,9 +328,14 @@ def _ownership(rank: int, pos: str) -> float:
     return round(base * (0.75 ** (rank - 1)), 1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+def _fmt_proj(projection: float) -> str:
+    """Format raw projection as a fixed 2-decimal number, e.g. 22.50."""
+    return f"{projection:.2f}"
+
+
+# ════
 # 4. Build projection rows
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 
 def build_rows(sleeper: dict, baselines: dict, multipliers: dict) -> list[list]:
     """Merge all three sources and return [HEADERS, row, row, …]."""
@@ -330,17 +370,17 @@ def build_rows(sleeper: dict, baselines: dict, multipliers: dict) -> list[list]:
                 p["pos"],
                 p["team"],
                 _salary(p["pos"], p["proj"], p["depth"]),
-                p["proj"],
-                _ownership(rank, p["pos"]),
+                _fmt_proj(p["proj"]),                    # e.g. "22.50"
+                round(_ownership(rank, p["pos"]) / 100, 4),  # e.g. 0.14
             ])
 
     log.info("Projection table: %d player rows built.", len(rows) - 1)
     return rows
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 # 5. Post to Google Sheets
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 
 def post_to_sheets(rows: list[list]) -> bool:
     if not GOOGLE_WEBAPP_URL:
@@ -363,9 +403,9 @@ def post_to_sheets(rows: list[list]) -> bool:
     return False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 # Entrypoint
-# ══════════════════════════════════════════════════════════════════════════════
+# ════
 
 if __name__ == "__main__":
     log.info("═══ NFL DFS Projection Pipeline — START ═══")
