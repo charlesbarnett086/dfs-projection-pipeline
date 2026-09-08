@@ -1,44 +1,23 @@
 name: Run DFS Projection Model
 on:
-workflow_dispatch: # Allows 1-click manual trigger from GitHub UI
-schedule:
-- cron: '0 21 * * *' # Automated daily run at 9:00 PM UTC
+  workflow_dispatch:
+  schedule:
+    - cron: '0 21 * * *'
 jobs:
-run-pipeline:
-runs-on: ubuntu-latest
-steps:
-- name: Checkout Repository Code
-•
-•
-•
-•
-•
-
-1.
-2.
-
-3.
-◦
-◦
-◦
-4.
-
-1.
-2.
-◦
-◦
-◦
-
-uses: actions/checkout@v4
-- name: Set up Python Environment
-uses: actions/setup-python@v5
-with:
-python-version: '3.11'
-- name: Install Dependencies
-run: |
-python -m pip install --upgrade pip
-pip install requests pandas rapidfuzz
-- name: Execute Model & Sync to Sheets
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas polars nflreadpy
+      - env:
+          GOOGLE_WEBAPP_URL: ${{ secrets.GOOGLE_WEBAPP_URL }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: python main.py
 env:
 GOOGLE_WEBAPP_URL: ${{ secrets.GOOGLE_WEBAPP_URL }}
 ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
